@@ -1,5 +1,6 @@
 // std includes
 #include <vector>
+#include <ctime>
 
 // Qt includes
 #include <QApplication>
@@ -21,6 +22,41 @@
 // Global variables for threads synchronization
 QMutex gVideoGuard;
 int gVideoIndex = -1;
+cv::Mat gWebcamImage;
+time_t gTimeLastPlay = 0;
+const int kMinIntervalToChangeStatus = 3;
+
+class WebcamGrebberThread : public QThread {
+public:
+  WebcamGrebberThread(QObject* parent)
+    : QThread(parent) {
+  }
+
+  void Stop(){
+    need_stop_ = true;
+  }
+
+protected:
+  virtual void run() override {
+    cv::VideoCapture cap;
+    if (!cap.open(0)) {
+      assert(!"failed to open webcam");
+      return;
+    }
+
+    cv::Mat img_webcam;
+    while (!need_stop_) {
+      cap >> img_webcam;
+      QMutexLocker lock(&gVideoGuard);
+      gWebcamImage = img_webcam.clone();
+    }
+
+    return;
+  }
+
+private:
+  bool need_stop_ = false;
+};
 
 class WebcamProcessThread : public QThread {
 public:
@@ -47,25 +83,27 @@ public:
   }
 
   virtual void run() override {
-    cv::VideoCapture cap;
-    if (!cap.open(0)) {
-      assert(!"failed to open webcam");
-      return;
-    }
-
-    cv::Mat img_webcam;
     while (!need_stop_) {
-      cap >> img_webcam;
-      for (size_t nn = 0; nn < input_images_.size(); ++nn) {
-        if (IsContains(img_webcam, input_images_.at(nn))) {
+      if (time(nullptr) - gTimeLastPlay >= kMinIntervalToChangeStatus) {
+        cv::Mat img_webcam;
+        {
           QMutexLocker lock(&gVideoGuard);
-          if (gVideoIndex == -1) {
-            gVideoIndex = static_cast<int>(nn);
+          if (!gWebcamImage.empty()) {
+            img_webcam = gWebcamImage.clone();
           }
         }
+        if (!img_webcam.empty()) {
+          for (size_t nn = 0; nn < input_images_.size(); ++nn) {
+            if (IsContains(img_webcam, input_images_.at(nn))) {
+              QMutexLocker lock(&gVideoGuard);
+              gVideoIndex = static_cast<int>(nn);
+            }
+          }
+        }
+      } else {
+        QThread::msleep(100);
       }
     }
-
     return;
   }
 
@@ -171,8 +209,8 @@ private:
     }
 
     // for debug purpose
-    // cv::imshow("result", img_matches);
-    // cvWaitKey(10);
+    cv::imshow("result", img_matches);
+    cvWaitKey(10);
     return homography_is_good;
   }
 
@@ -225,26 +263,46 @@ public:
 
     work_thread_ = new WebcamProcessThread(this);
     work_thread_->start();
+
+    grabber_thread_ = new WebcamGrebberThread(this);
+    grabber_thread_->start();
   }
 
   ~VideoDialog() override {
     work_thread_->Stop();
     work_thread_->wait();
+    grabber_thread_->Stop();
+    grabber_thread_->wait();
   }
 
 private:
   void OnTimerCheckVideoToShow() {
-    QMutexLocker lock(&gVideoGuard);
-    if (gVideoIndex == -1) {
-      return;
+    int curr_video_index = -1;
+    {
+      QMutexLocker lock(&gVideoGuard);
+      curr_video_index = gVideoIndex;
+    }
+
+    if (curr_video_index == -1) {
+      return; // no new video
+    } else if (curr_video_index == last_play_video) {
+      return; // current playing video not finished
     }
 
     if (player_->state() != QMediaPlayer::StoppedState) {
-      return;
+      player_->stop(); // current playing video not finished but must play new video
     }
 
+    {
+      QMutexLocker lock(&gVideoGuard);
+      gTimeLastPlay = time(nullptr);
+      gVideoIndex = -1;
+    }
+
+    qDebug() << "play: " << curr_video_index;
+
     // !! CHANGE !! set video paths
-    switch (gVideoIndex) {
+    switch (curr_video_index) {
     default:
       assert(!"invalid video index");
     case 0:
@@ -255,18 +313,20 @@ private:
       break;
     }
     player_->play();
+    last_play_video = curr_video_index;
   }
 
   void OnStateChanged(QMediaPlayer::State state) {
     if (state == QMediaPlayer::StoppedState) {
-      // reset searching on video finish
-      QMutexLocker lock(&gVideoGuard);
-      gVideoIndex = -1;
+      // reset on finish playing
+      last_play_video = -1;
     }
   }
 
   QMediaPlayer* player_ = nullptr;
   WebcamProcessThread* work_thread_ = nullptr;
+  WebcamGrebberThread* grabber_thread_ = nullptr;
+  int last_play_video = -1;
 
 };
 
