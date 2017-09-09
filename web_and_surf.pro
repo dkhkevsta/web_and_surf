@@ -27,4 +27,6 @@ LIBS = \
   -lopencv_core$${LIB_POSTFIX} \
   -lopencv_nonfree$${LIB_POSTFIX}
 
-
+# config MySQL
+INCLUDEPATH += "C:\Program Files (x86)\MySQL2\MySQL Server 5.7\include"
+LIBS += -L"C:\Program Files (x86)\MySQL2\MySQL Server 5.7\lib" -llibmysql

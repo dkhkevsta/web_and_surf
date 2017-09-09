@@ -1,3 +1,7 @@
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
 // std includes
 #include <vector>
 #include <ctime>
@@ -5,12 +9,14 @@
 // Qt includes
 #include <QApplication>
 #include <QDialog>
-#include <QMediaPlayer>
-#include <QMediaPlaylist>
 #include <QThread>
 #include <QTimer>
 #include <QVBoxLayout>
-#include <QVideoWidget>
+#include <QLabel>
+#include <QTime>
+#include <QFile>
+#include <QDateTime>
+#include <QDebug>
 
 // OpenCV includes
 #include <opencv2/core/core.hpp>
@@ -19,17 +25,20 @@
 #include <opencv2/nonfree/features2d.hpp>
 #include <opencv2/calib3d/calib3d.hpp>
 
+// MySQL includes
+#include <my_global.h>
+#include <mysql.h>
+
 // Global variables for threads synchronization
 QMutex gVideoGuard;
-int gVideoIndex = -1;
 cv::Mat gWebcamImage;
-time_t gTimeLastPlay = 0;
-const int kMinIntervalToChangeStatus = 3;
+const int kMinIntervalToWriteToDb = 3000; // ms
 
-class WebcamGrebberThread : public QThread {
+class WebcamGrabberThread : public QThread {
 public:
-  WebcamGrebberThread(QObject* parent)
-    : QThread(parent) {
+  WebcamGrabberThread(int web_cam_id, QObject* parent)
+      : QThread(parent),
+      web_cam_id_(web_cam_id) {
   }
 
   void Stop(){
@@ -39,7 +48,7 @@ public:
 protected:
   virtual void run() override {
     cv::VideoCapture cap;
-    if (!cap.open(0)) {
+    if (!cap.open(web_cam_id_)) {
       assert(!"failed to open webcam");
       return;
     }
@@ -56,27 +65,31 @@ protected:
 
 private:
   bool need_stop_ = false;
+  const int web_cam_id_ = -1;
 };
 
 class WebcamProcessThread : public QThread {
 public:
-  WebcamProcessThread(QObject* parent)
+  WebcamProcessThread(int web_cam_id, MYSQL* mysql_object, const std::vector<std::pair<int, std::string>>& patterns, QObject* parent)
     : QThread(parent),
-      detector_(400) {
-
-    // !! CHANGE !! set image paths
-    AddImputImage("C:\\cache\\1.png");
-    AddImputImage("C:\\cache\\2.png");
+      detector_(400),
+      mysql_object_(mysql_object),
+      web_cam_id_(web_cam_id) {
+    for (const std::pair<int, std::string>& next : patterns) {
+      AddImputImage(next.first, next.second);
+      AddImputImage(next.first, next.second);
+    }
+    time_last_image_.restart();
   }
 
-  void AddImputImage(const std::string& file_name) {
+  void AddImputImage(int id, const std::string& file_name) {
     cv::Mat img_match = cv::imread(file_name, CV_LOAD_IMAGE_GRAYSCALE);
     if (!img_match.data) {
       assert(!"failed to open file");
       return;
     }
 
-    InputImageDescription next_image = { img_match };
+    InputImageDescription next_image = { id, img_match };
     detector_.detect(next_image.image, next_image.keypoints);
     extractor_.compute(img_match, next_image.keypoints, next_image.descriptors);
     input_images_.push_back(next_image);
@@ -84,7 +97,8 @@ public:
 
   virtual void run() override {
     while (!need_stop_) {
-      if (time(nullptr) - gTimeLastPlay >= kMinIntervalToChangeStatus) {
+//      qDebug() << time_last_image_.elapsed();
+      if (time_last_image_.elapsed() > kMinIntervalToWriteToDb) {
         cv::Mat img_webcam;
         {
           QMutexLocker lock(&gVideoGuard);
@@ -95,8 +109,9 @@ public:
         if (!img_webcam.empty()) {
           for (size_t nn = 0; nn < input_images_.size(); ++nn) {
             if (IsContains(img_webcam, input_images_.at(nn))) {
-              QMutexLocker lock(&gVideoGuard);
-              gVideoIndex = static_cast<int>(nn);
+              time_last_image_.restart();
+              WriteToDb(input_images_.at(nn).id);
+              break;
             }
           }
         }
@@ -107,12 +122,23 @@ public:
     return;
   }
 
+  void WriteToDb(int pattern_id) {
+    const std::string query = "INSERT INTO results (cam_id, pattern, time) VALUES ('"
+              + std::to_string(web_cam_id_) + "', '"
+              + std::to_string(pattern_id) + "', '"
+              + QDateTime::currentDateTime().toUTC().toString("yyyy-MM-dd HH:mm:ss").toStdString() + "')";
+    if (mysql_query(mysql_object_, query.c_str())) {
+      assert(!"failed execute query");
+    }
+  }
+
   void Stop() {
     need_stop_ = true;
   }
 
 private:
   struct InputImageDescription {
+    int id;
     cv::Mat image;
     std::vector<cv::KeyPoint> keypoints;
     cv::Mat descriptors;
@@ -242,97 +268,88 @@ private:
   cv::SurfFeatureDetector detector_;
   cv::SurfDescriptorExtractor extractor_;
   std::vector<InputImageDescription> input_images_;
-};
-
-class VideoDialog : public QDialog {
-public:
-  VideoDialog(QWidget* parent)
-    : QDialog(parent) {
-    QVBoxLayout* vl = new QVBoxLayout(this);
-    player_ = new QMediaPlayer(this);
-    connect(player_, &QMediaPlayer::stateChanged, this, &VideoDialog::OnStateChanged);
-    QVideoWidget* video_widget = new QVideoWidget(this);
-    vl->addWidget(video_widget);
-    player_->setVideoOutput(video_widget);
-    resize(600, 400);
-
-    QTimer* timer = new QTimer(this);
-    timer->setInterval(500);
-    connect(timer, &QTimer::timeout, this, &VideoDialog::OnTimerCheckVideoToShow);
-    timer->start();
-
-    work_thread_ = new WebcamProcessThread(this);
-    work_thread_->start();
-
-    grabber_thread_ = new WebcamGrebberThread(this);
-    grabber_thread_->start();
-  }
-
-  ~VideoDialog() override {
-    work_thread_->Stop();
-    work_thread_->wait();
-    grabber_thread_->Stop();
-    grabber_thread_->wait();
-  }
-
-private:
-  void OnTimerCheckVideoToShow() {
-    int curr_video_index = -1;
-    {
-      QMutexLocker lock(&gVideoGuard);
-      curr_video_index = gVideoIndex;
-    }
-
-    if (curr_video_index == -1) {
-      return; // no new video
-    } else if (curr_video_index == last_play_video) {
-      return; // current playing video not finished
-    }
-
-    if (player_->state() != QMediaPlayer::StoppedState) {
-      player_->stop(); // current playing video not finished but must play new video
-    }
-
-    {
-      QMutexLocker lock(&gVideoGuard);
-      gTimeLastPlay = time(nullptr);
-      gVideoIndex = -1;
-    }
-
-    qDebug() << "play: " << curr_video_index;
-
-    // !! CHANGE !! set video paths
-    switch (curr_video_index) {
-    default:
-      assert(!"invalid video index");
-    case 0:
-      player_->setMedia(QUrl::fromLocalFile("C:/cache/sirf/video.3gp"));
-      break;
-    case 1:
-      player_->setMedia(QUrl::fromLocalFile("C:/cache/sirf/video1.3gp"));
-      break;
-    }
-    player_->play();
-    last_play_video = curr_video_index;
-  }
-
-  void OnStateChanged(QMediaPlayer::State state) {
-    if (state == QMediaPlayer::StoppedState) {
-      // reset on finish playing
-      last_play_video = -1;
-    }
-  }
-
-  QMediaPlayer* player_ = nullptr;
-  WebcamProcessThread* work_thread_ = nullptr;
-  WebcamGrebberThread* grabber_thread_ = nullptr;
-  int last_play_video = -1;
-
+  QTime time_last_image_;
+  MYSQL* mysql_object_ = nullptr;
+  const int web_cam_id_ = 0;
 };
 
 int main(int argc, char* argv[]) {
+  if (argc != 2) {
+    assert(!"invalid usage");
+    return 1;
+  }
+
+  // opening DB
+  MYSQL* mysql_object = mysql_init(nullptr);
+  if (!mysql_object) {
+    assert(!"failed create db object");
+    return 1;
+  }
+
+  if (mysql_real_connect(mysql_object, "127.0.0.1", "sploid", "sploid", "recognition", 3306, 0, 0) == nullptr) {
+    assert(!"failed connect to db");
+    mysql_close(mysql_object);
+    mysql_object = nullptr;
+    return 1;
+  }
+
+  if (mysql_set_character_set(mysql_object, "utf8")) {
+    assert(!"failed set UTF8 charset");
+    mysql_close(mysql_object);
+    mysql_object = nullptr;
+    return 1;
+  }
+
+  // loading patterns from MySQL
+  if (mysql_query(mysql_object, "SELECT id, path FROM patterns")) {
+    assert(!"failed execut query");
+    mysql_close(mysql_object);
+    mysql_object = nullptr;
+    return 1;
+  }
+
+  MYSQL_RES* result = mysql_store_result(mysql_object);
+  if (!result) {
+    assert(!"failed store query results");
+    mysql_close(mysql_object);
+    mysql_object = nullptr;
+    return 1;
+  }
+
+  MYSQL_ROW row = mysql_fetch_row(result);
+  std::vector<std::pair<int, std::string>> patterns;
+  while (row) {
+    patterns.push_back(std::make_pair(atoi(row[0]), std::string(row[1])));
+    row = mysql_fetch_row(result);
+  }
+  mysql_free_result(result);
+  result = nullptr;
+  // checking that all files exists
+  for (const std::pair<int, std::string>& next : patterns) {
+    if (!QFile::exists(next.second.c_str())) {
+      assert(!"file not exists");
+      return 1;
+    }
+  }
+
   QApplication a(argc, argv);
-  VideoDialog vd(nullptr);
-  vd.show();
-  return a.exec();
+
+  // starting work
+  const int web_cam_id = atoi(argv[1]);
+  WebcamGrabberThread grabber_thread(web_cam_id, &a);
+  grabber_thread.start();
+  WebcamProcessThread work_thread(web_cam_id, mysql_object, patterns, &a);
+  work_thread.start();
+
+  // processing GUI events
+  const int exec_res = a.exec();
+
+  // stopping work
+  grabber_thread.Stop();
+  grabber_thread.wait();
+  work_thread.Stop();
+  work_thread.wait();
+  mysql_close(mysql_object);
+  mysql_object = nullptr;
+  return exec_res;
 }
